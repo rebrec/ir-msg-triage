@@ -9,6 +9,31 @@ dans un client mail, pas d'exécution de macro, pas de requête réseau.
 
 ---
 
+## Installation rapide
+
+```bash
+git clone https://github.com/rebrec/ir-msg-triage.git
+cd ir-msg-triage
+
+python3 -m venv .venv
+source .venv/bin/activate          # Windows : .venv\Scripts\activate
+
+pip install extract-msg oletools
+```
+
+Puis, pour vérifier que tout est en place :
+
+```bash
+python3 msg_triage.py --help
+```
+
+L'outil est un **script autonome** : aucune installation supplémentaire, il s'exécute
+directement depuis le dossier cloné. Les deux dépendances ci-dessus sont d'ailleurs
+optionnelles — voir [Prérequis](#prérequis) — un fichier `.eml` s'analyse sans rien
+installer du tout.
+
+---
+
 ## Ce que fait l'outil
 
 | Volet | Détail |
