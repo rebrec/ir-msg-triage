@@ -1,2 +1,4 @@
 .claude
+*.eml
 output/
+__pycache__

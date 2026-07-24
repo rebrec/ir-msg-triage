@@ -31,6 +31,69 @@ URL_RE = re.compile(r'https?://[^\s<>"\')]+', re.I)
 IP_RE = re.compile(r'\b(?:\d{1,3}\.){3}\d{1,3}\b')
 EMAIL_RE = re.compile(r'[\w.\-+]+@[\w.\-]+\.\w+')
 
+# Bloc Received complet, continuations repliees incluses.
+RECEIVED_RE = re.compile(r'^Received:.*?(?=^\S|\Z)', re.M | re.S | re.I)
+
+# Types MISP -> categorie MISP. Vocabulaire aligne sur l'objet "email" de
+# misp-objects, pour rester importable dans MISP sans retraduction.
+IOC_TYPE_CATEGORY = {
+    "url": "Payload delivery",
+    "ip-src": "Network activity",
+    "email": "Payload delivery",
+    "email-src": "Payload delivery",
+    "email-dst": "Payload delivery",
+    "email-reply-to": "Payload delivery",
+    "email-message-id": "Payload delivery",
+}
+
+# Type MISP -> section du rapport.
+IOC_BUCKET = {
+    "url": "urls",
+    "ip-src": "ips",
+    "email": "emails",
+    "email-src": "emails",
+    "email-dst": "emails",
+    "email-reply-to": "emails",
+    "email-message-id": "emails",
+}
+
+# Provenance d'un IOC : cle machine -> libelle affiche.
+ORIGIN_LABELS = {
+    "header.from": "Expediteur (From)",
+    "header.sender_display": "Expediteur affiche",
+    "header.to": "Destinataire (To)",
+    "header.cc": "Destinataire (Cc)",
+    "header.reply_to": "Adresse de reponse (Reply-To)",
+    "header.return_path": "Chemin de retour (Return-Path)",
+    "header.message_id": "Identifiant du message (Message-ID)",
+    "header.received_spf": "IP emettrice declaree SPF",
+    "body.text": "Corps du message (texte)",
+    "body.html.text": "Texte visible du corps HTML",
+    "body.html.href": "Lien cliquable dans le corps HTML",
+    "body.html.img": "Image distante (pixel de tracage possible)",
+    "body.html.comment": "Commentaire HTML - non visible a la lecture",
+    "body.html.style": "CSS (background-image, @import)",
+    "body.html.other": "Balise HTML (source, non visible a la lecture)",
+    "attachment.name": "Nom de piece jointe",
+}
+
+# Origines par ordre de valeur d'analyse : quand un IOC apparait a plusieurs
+# endroits, c'est le contexte de la plus haute qui est retenu.
+ORIGIN_PRIORITY = (
+    "header.received_spf", "header.from", "header.sender_display",
+    "header.reply_to", "header.return_path", "header.received",
+    "header.to", "header.cc", "header.message_id",
+    "body.html.meta", "body.html.href", "body.html.img",
+    "body.html.comment", "body.html.style",
+    "body.text", "body.html.text", "body.html.other", "attachment.name",
+)
+
+# Hotes de namespace XML/DTD : presents dans tout mail HTML, jamais un IOC.
+NAMESPACE_HOSTS = {
+    "www.w3.org", "w3.org", "schemas.microsoft.com", "schemas.openxmlformats.org",
+    "purl.org", "schema.org", "www.iana.org", "ns.adobe.com",
+}
+
 
 def hashes(data: bytes) -> dict:
     return {
@@ -47,12 +110,266 @@ def defang(s: str) -> str:
     return s.replace("http://", "hxxp://").replace("https://", "hxxps://")
 
 
+def origin_label(origin: str) -> str:
+    """Libelle affichable d'une origine, y compris les formes indexees
+    (header.received[3], body.html.meta[og:url])."""
+    if origin in ORIGIN_LABELS:
+        return ORIGIN_LABELS[origin]
+    m = re.match(r"header\.received\[(\d+)\]$", origin)
+    if m:
+        return f"Saut Received n{m.group(1)}"
+    m = re.match(r"body\.html\.meta\[(.+)\]$", origin)
+    if m:
+        prop = m.group(1)
+        if prop.lower() == "og:url":
+            return "Metadonnee Open Graph (og:url) - URL canonique, non visible a la lecture"
+        return f"Metadonnee HTML <{prop}> - non visible a la lecture"
+    return origin
+
+
+def origin_rank(origin: str) -> int:
+    for i, prefix in enumerate(ORIGIN_PRIORITY):
+        if origin.startswith(prefix):
+            return i
+    return len(ORIGIN_PRIORITY)
+
+
+def url_host(url: str) -> str:
+    from urllib.parse import urlsplit
+    try:
+        return (urlsplit(url).hostname or "").lower()
+    except ValueError:
+        return ""
+
+
+def clean_url(url: str) -> str:
+    """Retire la ponctuation de fin, souvent capturee par le regex."""
+    return url.rstrip(".,;:!?")
+
+
+def valid_ipv4(value: str) -> bool:
+    import ipaddress
+    try:
+        ipaddress.IPv4Address(value)
+        return True
+    except ValueError:
+        return False
+
+
+def non_actionable_ip(value: str) -> str:
+    """Motif pour lequel une IP n'est pas exploitable en detection, sinon ''."""
+    import ipaddress
+    ip = ipaddress.IPv4Address(value)
+    if ip.is_private or ip.is_loopback or ip.is_link_local:
+        return "RFC1918/locale - infrastructure de transit"
+    if ip.is_reserved or ip.is_multicast or ip.is_unspecified:
+        return "plage reservee - non routable"
+    return ""
+
+
+def extract_snippet(source: str, value: str, span: int = 150) -> str:
+    """Extrait le contexte source autour de la 1re occurrence, pour que
+    l'analyste retrouve l'IOC dans le message."""
+    if not source or not value:
+        return ""
+    i = source.find(value)
+    if i < 0:
+        return ""
+    a = max(0, i - span // 2)
+    b = min(len(source), i + len(value) + span // 2)
+    frag = " ".join(source[a:b].split())
+    return ("..." if a > 0 else "") + frag + ("..." if b < len(source) else "")
+
+
+def make_ioc(value: str, type_: str, origin: str, context: str = "", source: str = "") -> dict:
+    """Fabrique un IOC annote : type/categorie MISP, provenance, actionnabilite."""
+    value = value.strip()
+    reason = ""
+    if type_ == "ip-src":
+        reason = non_actionable_ip(value)
+    elif type_ == "url":
+        if url_host(value) in NAMESPACE_HOSTS:
+            reason = "namespace XML/DTD - pas un IOC"
+    elif type_ == "email-dst":
+        reason = "destinataire (victime) - ne pas bloquer"
+    elif type_ == "email-message-id":
+        reason = "identifiant unique du message - non bloquant"
+    return {
+        "value": value,
+        "display": defang(value),
+        "type": type_,
+        "category": IOC_TYPE_CATEGORY.get(type_, "Other"),
+        "origins": [origin],
+        "context": context or origin_label(origin),
+        "snippet": defang(extract_snippet(source, value)),
+        "to_ids": not reason,
+        "reason": reason or None,
+        "occurrences": 1,
+        "_rank": origin_rank(origin),
+    }
+
+
+def merge_iocs(records: list) -> list:
+    """Fusionne par (valeur, type) : union des origines, contexte et extrait
+    de l'origine la plus significative."""
+    merged = {}
+    for r in records:
+        key = (r["value"], r["type"])
+        cur = merged.get(key)
+        if cur is None:
+            merged[key] = r
+            continue
+        for o in r["origins"]:
+            if o not in cur["origins"]:
+                cur["origins"].append(o)
+        cur["occurrences"] += r["occurrences"]
+        if r["_rank"] < cur["_rank"]:
+            cur["context"] = r["context"]
+            cur["snippet"] = r["snippet"] or cur["snippet"]
+            cur["_rank"] = r["_rank"]
+    out = []
+    for r in merged.values():
+        r["origins"].sort(key=origin_rank)
+        r.pop("_rank", None)
+        out.append(r)
+    return out
+
+
+def scan_region(text: str, origin: str, source: str, context: str = "") -> list:
+    """Extrait URLs / IPs / emails d'une zone, toutes rattachees a une origine."""
+    recs = []
+    for u in URL_RE.findall(text):
+        recs.append(make_ioc(clean_url(u), "url", origin, context, source))
+    for ip in IP_RE.findall(text):
+        if valid_ipv4(ip):
+            recs.append(make_ioc(ip, "ip-src", origin, context, source))
+    for a in EMAIL_RE.findall(text):
+        # type generique : une adresse citee dans un corps n'est pas l'expediteur
+        recs.append(make_ioc(a, "email", origin, context, source))
+    return recs
+
+
+def meta_origin(m) -> str:
+    prop = re.search(r'\b(?:property|name)\s*=\s*["\']([^"\']+)["\']', m.group(0), re.I)
+    return f"body.html.meta[{prop.group(1)}]" if prop else "body.html.meta"
+
+
+def consume(src: str, pattern: str, origin_of):
+    """Retire du source les zones correspondant au motif et renvoie
+    (reste, [(origine, zone)]). Le remplacement conserve la longueur."""
+    found = []
+
+    def repl(m):
+        found.append((origin_of(m), m.group(0)))
+        return " " * (m.end() - m.start())
+
+    return re.sub(pattern, repl, src, flags=re.I | re.S), found
+
+
+def collect_html_iocs(html_src: str) -> list:
+    """Passes ordonnees sur le source HTML : chaque zone reconnue est retiree
+    du reste, pour qu'un IOC soit rattache a son role exact et une seule fois."""
+    steps = [
+        (r"<!--.*?-->", lambda m: "body.html.comment"),
+        (r"<meta\b[^>]*>", meta_origin),
+        (r"<style\b[^>]*>.*?</style>", lambda m: "body.html.style"),
+        (r"""\bstyle\s*=\s*"[^"]*"|\bstyle\s*=\s*'[^']*'""", lambda m: "body.html.style"),
+        (r"<a\b[^>]*>", lambda m: "body.html.href"),
+        (r"<img\b[^>]*>", lambda m: "body.html.img"),
+        (r"<[^>]+>", lambda m: "body.html.other"),
+    ]
+    recs, rest = [], html_src
+    for pattern, origin_of in steps:
+        rest, found = consume(rest, pattern, origin_of)
+        for origin, region in found:
+            recs += scan_region(region, origin, html_src)
+    recs += scan_region(rest, "body.html.text", html_src)
+    return recs
+
+
+def collect_iocs(data: dict, auth: dict, body_text: str, body_html: str) -> dict:
+    """IOCs annotes issus des en-tetes, des deux corps et des noms de PJ."""
+    from email.utils import getaddresses
+
+    raw = data.get("raw_headers") or ""
+    recs = []
+
+    # 1. En-tetes d'adresses (getaddresses gere les formes 'Nom <adresse>')
+    from_domain = ""
+    for key, origin, type_ in (
+        ("from", "header.from", "email-src"),
+        ("sender_display", "header.sender_display", "email-src"),
+        ("to", "header.to", "email-dst"),
+        ("cc", "header.cc", "email-dst"),
+        ("reply_to", "header.reply_to", "email-reply-to"),
+        ("return_path", "header.return_path", "email-src"),
+        ("message_id", "header.message_id", "email-message-id"),
+    ):
+        value = data.get(key)
+        if not value:
+            continue
+        for _, addr in getaddresses([str(value)]):
+            if "@" not in addr:
+                continue
+            domain = addr.rsplit("@", 1)[1].lower()
+            if key == "from":
+                from_domain = domain
+            context = ""
+            if key == "reply_to" and from_domain and domain != from_domain:
+                context = ("Adresse de reponse (Reply-To) - domaine different du From, "
+                           "detournement de reponse possible")
+            recs.append(make_ioc(addr, type_, origin, context, raw))
+
+    # 2. IP declaree par le Received-SPF : l'emetteur reel vu par le destinataire
+    if auth.get("spf_client_ip"):
+        verdict = auth.get("spf_result") or "?"
+        recs.append(make_ioc(
+            auth["spf_client_ip"], "ip-src", "header.received_spf",
+            f"IP emettrice declaree SPF (SPF {verdict})", raw))
+
+    # 3. Chemin Received : le saut le plus ancien porte l'origine declaree
+    hops = RECEIVED_RE.findall(raw)
+    for n, hop in enumerate(hops, 1):
+        context = ""
+        if n == len(hops) > 1:
+            context = f"Saut Received n{n} - le plus ancien, origine declaree"
+        for ip in IP_RE.findall(hop):
+            if valid_ipv4(ip):
+                recs.append(make_ioc(ip, "ip-src", f"header.received[{n}]", context, raw))
+
+    # 4/5. Corps. Le HTML est desechappe d'abord, sinon chaque URL ressort en
+    # double (variante &amp; et variante &).
+    recs += scan_region(body_text, "body.text", body_text)
+    if body_html:
+        from html import unescape
+        html_src = unescape(body_html)
+        recs += collect_html_iocs(html_src)
+
+    # 6. Noms de PJ (une URL ou une adresse peut s'y cacher)
+    for att in data.get("attachments") or []:
+        name = att.get("name") or ""
+        recs += scan_region(name, "attachment.name", name)
+
+    out = {"urls": [], "ips": [], "emails": []}
+    for r in merge_iocs(recs):
+        out[IOC_BUCKET[r["type"]]].append(r)
+    for bucket in out.values():
+        bucket.sort(key=lambda r: (not r["to_ids"], r["value"]))
+    return out
+
+
 def analyse_headers(raw: str) -> dict:
-    out = {"spf": None, "dkim": None, "dmarc": None, "received_path": []}
+    out = {"spf": None, "dkim": None, "dmarc": None, "received_path": [],
+           "spf_client_ip": None, "spf_result": None}
     for line in raw.splitlines():
         low = line.lower()
         if "received-spf:" in low and out["spf"] is None:
-            out["spf"] = line.split(":", 1)[1].strip()[:200]
+            spf = line.split(":", 1)[1].strip()
+            out["spf"] = spf[:200]
+            out["spf_result"] = spf.split(None, 1)[0] if spf else None
+            m = re.search(r"client-ip=([0-9.]+)", spf, re.I)
+            if m and valid_ipv4(m.group(1)):
+                out["spf_client_ip"] = m.group(1)
         if "dkim=" in low and out["dkim"] is None:
             m = re.search(r"dkim=(\w+)", low)
             out["dkim"] = m.group(1) if m else None
@@ -84,12 +401,33 @@ def render_html(report: dict) -> str:
             ("Sujet", report["subject"]), ("Date", report["date"]),
             ("From (affiche)", report["sender_display"]), ("From (entete)", report["from"]),
             ("Reply-To", report["reply_to"]), ("Return-Path", report["return_path"]),
-            ("To", report["to"]), ("Message-ID", report["message_id"]),
+            ("To", report["to"]), ("Cc", report.get("cc")),
+            ("Message-ID", report["message_id"]),
         ])
 
-    urls = "".join(f"<li><code>{escape(u)}</code></li>" for u in io["urls"]) or "<li>-</li>"
-    ips = ", ".join(escape(x) for x in io["ips"]) or "-"
-    emails = ", ".join(escape(x) for x in io["emails"]) or "-"
+    def ioc_block(title, key):
+        actionable = [r for r in io[key] if r["to_ids"]]
+        discarded = [r for r in io[key] if not r["to_ids"]]
+        rows = ""
+        for r in actionable:
+            snip = (f"<br><span class='snip'>{escape(r['snippet'])}</span>"
+                    if r["snippet"] else "")
+            rows += (f"<tr><td><code>{escape(r['display'])}</code>{snip}</td>"
+                     f"<td>{escape(r['type'])}</td>"
+                     f"<td>{escape(r['context'])}</td></tr>")
+        body = (f"<table><tr><th>Valeur</th><th>Type</th><th>Origine / contexte</th></tr>"
+                f"{rows}</table>" if rows else "<p>-</p>")
+        if discarded:
+            drows = "".join(
+                f"<tr><td><code>{escape(r['display'])}</code></td>"
+                f"<td>{escape(r['type'])}</td><td>{escape(r['reason'])}</td></tr>"
+                for r in discarded)
+            body += (f"<details class='muted'><summary>{len(discarded)} non actionnable(s)"
+                     f"</summary><table>{drows}</table></details>")
+        return f"<h3>{title} ({len(actionable)})</h3>{body}"
+
+    iocs_html = "".join(ioc_block(t, k) for t, k in
+                        (("URLs", "urls"), ("IPs", "ips"), ("Emails", "emails")))
 
     att_rows = ""
     for a in report["attachments"]:
@@ -121,6 +459,10 @@ table{{border-collapse:collapse;width:100%}} th,td{{border:1px solid #ddd;paddin
 th{{background:#f5f5f5;white-space:nowrap}} code{{background:#f0f0f0;padding:1px 4px;border-radius:3px}}
 pre{{background:#f8f8f8;padding:10px;border:1px solid #ddd;white-space:pre-wrap;word-break:break-word}}
 .warn{{background:#fff3e0;border-left:4px solid #ef6c00;padding:10px;margin:10px 0}}
+h3{{margin:18px 0 6px;font-size:15px;color:#555}}
+.snip{{color:#666;font-size:11px;font-family:monospace;word-break:break-all}}
+.muted{{margin-top:6px}} .muted table{{opacity:.6}}
+.muted summary{{cursor:pointer;color:#757575;font-size:13px}}
 </style></head><body>
 <h1>Triage IR - .MSG</h1>
 <div class="warn">Rapport defang : les URLs sont en <code>hxxp(s)</code>. Le corps HTML d'origine est isole dans une iframe <b>sandbox</b> (scripts et reseau bloques).</div>
@@ -133,8 +475,9 @@ pre{{background:#f8f8f8;padding:10px;border:1px solid #ddd;white-space:pre-wrap;
 <details><summary>Chemin Received</summary><ul>{received}</ul></details>
 
 <h2>IOCs</h2>
-<b>URLs ({len(io['urls'])})</b><ul>{urls}</ul>
-<p><b>IPs :</b> {ips}<br><b>Emails :</b> {emails}</p>
+<p>Chaque IOC porte son origine dans le message. Les valeurs non exploitables en detection
+(IP de transit, namespace XML, destinataire) sont regroupees a part.</p>
+{iocs_html}
 
 <h2>Pieces jointes ({len(report['attachments'])})</h2>
 <table><tr><th>Nom</th><th>Taille</th><th>Flags</th><th>SHA256 / VBA</th></tr>{att_rows}</table>
@@ -144,6 +487,11 @@ pre{{background:#f8f8f8;padding:10px;border:1px solid #ddd;white-space:pre-wrap;
 
 <h2>Corps du message (HTML rendu - sandbox)</h2>
 {iframe}
+
+<h2>Source HTML</h2>
+<p>Source defangee, pour retrouver un IOC qui n'apparait pas a la lecture (metadonnee,
+commentaire, CSS).</p>
+<details><summary>Afficher</summary><pre>{escape(report['body_html'] or '(aucun corps HTML)')}</pre></details>
 
 <h2>En-tetes bruts</h2>
 <details><summary>Afficher</summary><pre>{escape(report['raw_headers'])}</pre></details>
@@ -164,6 +512,8 @@ def render_text(report: dict, dump=None) -> str:
     p(f"Reply-To      : {report['reply_to']}")
     p(f"Return-Path   : {report['return_path']}")
     p(f"To            : {report['to']}")
+    if report.get("cc"):
+        p(f"Cc            : {report['cc']}")
     p(f"Message-ID    : {report['message_id']}")
 
     ar = report["auth_results"]
@@ -174,11 +524,18 @@ def render_text(report: dict, dump=None) -> str:
 
     io = report["iocs"]
     p(f"\n-- IOCs (defanged) --")
-    p(f"URLs   : {len(io['urls'])}")
-    for u in io["urls"]:
-        p(f"   {u}")
-    p(f"IPs    : {', '.join(io['ips']) or '-'}")
-    p(f"Emails : {', '.join(io['emails']) or '-'}")
+    for title, key in (("URLs", "urls"), ("IPs", "ips"), ("Emails", "emails")):
+        actionable = [r for r in io[key] if r["to_ids"]]
+        discarded = [r for r in io[key] if not r["to_ids"]]
+        p(f"\n{title} : {len(actionable)} actionnable(s)"
+          + (f", {len(discarded)} ecarte(s)" if discarded else ""))
+        for r in actionable or []:
+            p(f"   {r['display']}")
+            p(f"      [{r['type']}] {r['context']}")
+        if not actionable:
+            p("   -")
+        for r in discarded:
+            p(f"   (ecarte) {r['display']}  -> {r['reason']}")
 
     atts = report["attachments"]
     p(f"\n-- Pieces jointes ({len(atts)}) --")
@@ -202,16 +559,13 @@ def render_text(report: dict, dump=None) -> str:
 def render_iocs(report: dict) -> str:
     """Liste plate d'IOCs defanges, une par ligne (import SIEM / blocage)."""
     io = report["iocs"]
-    L = [f"# IOCs - {report['file']}", f"# {report['subject']}", ""]
-    L.append("[URLs]")
-    L += io["urls"] or ["-"]
-    L.append("")
-    L.append("[IPs]")
-    L += io["ips"] or ["-"]
-    L.append("")
-    L.append("[Emails]")
-    L += io["emails"] or ["-"]
-    L.append("")
+    L = [f"# IOCs - {report['file']}", f"# {report['subject']}",
+         "# Seuls les IOCs actionnables (to_ids) sont exportes.", ""]
+    for title, key in (("URLs", "urls"), ("IPs", "ips"), ("Emails", "emails")):
+        rows = [r for r in io[key] if r["to_ids"]]
+        L.append(f"[{title}]")
+        L += [f"{r['display']}  # {r['context']}" for r in rows] or ["-"]
+        L.append("")
     L.append("[Hashes PJ - SHA256]")
     L += [f"{a['sha256']}  {a['name']}" for a in report["attachments"]] or ["-"]
     return "\n".join(L) + "\n"
@@ -261,6 +615,13 @@ def export_all(report: dict, src_path: str, blobs: list) -> None:
     f.write_text(report["raw_headers"] or "(aucun)", encoding="utf-8")
     created.append((rel(f), "en-tetes SMTP bruts"))
 
+    if report["body_html"]:
+        # Extension .txt volontaire : un .html s'ouvrirait dans un navigateur au
+        # double-clic et executerait ses scripts, que defang() ne neutralise pas.
+        f = outdir / "corps_html_source.txt"
+        f.write_text(report["body_html"], encoding="utf-8")
+        created.append((rel(f), "source HTML defangee (greppable)"))
+
     if blobs:
         attdir.mkdir(parents=True, exist_ok=True)
         for name, blob in blobs:
@@ -295,6 +656,7 @@ def load_msg(path: str) -> dict:
         "reply_to": m.header.get("Reply-To") if m.header else None,
         "return_path": m.header.get("Return-Path") if m.header else None,
         "to": m.to,
+        "cc": m.cc,
         "message_id": m.messageId,
         "raw_headers": m.headerText or "",
         "body_text": m.body or "",
@@ -347,6 +709,7 @@ def load_eml(path: str) -> dict:
         "reply_to": hdr("Reply-To"),
         "return_path": hdr("Return-Path"),
         "to": hdr("To"),
+        "cc": hdr("Cc"),
         "message_id": hdr("Message-ID"),
         "raw_headers": raw_headers,
         "body_text": body_text,
@@ -372,6 +735,7 @@ def main():
 
     data = load_message(args.msg)
     report = {
+        "schema_version": 2,
         "file": args.msg,
         "file_hashes": hashes(Path(args.msg).read_bytes()),
         "subject": data["subject"],
@@ -381,6 +745,7 @@ def main():
         "reply_to": data["reply_to"],
         "return_path": data["return_path"],
         "to": data["to"],
+        "cc": data.get("cc"),
         "message_id": data["message_id"],
     }
 
@@ -399,12 +764,7 @@ def main():
         body_text = "\n".join(l.strip() for l in txt.splitlines() if l.strip())
         body_text = "[derive du HTML]\n" + body_text
     # IOCs extraits AVANT defang (sinon le regex http(s) ne matche plus)
-    body = body_text + "\n" + body_html
-    report["iocs"] = {
-        "urls": sorted({defang(u) for u in URL_RE.findall(body)}),
-        "ips": sorted({defang(i) for i in IP_RE.findall(body)}),
-        "emails": sorted(set(EMAIL_RE.findall(body))),
-    }
+    report["iocs"] = collect_iocs(data, report["auth_results"], body_text, body_html)
     # On defang les corps stockes : liens non cliquables dans l'iframe HTML
     # (href/src casses) et dans le texte.
     report["raw_headers"] = defang(raw_headers)
